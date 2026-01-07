@@ -1,12 +1,12 @@
 # Training Configuration for Wan2.1 Action LoRA
 
 # Model Paths
-checkpoint_dir: "/disk2/licheng/models/Wan2.1-I2V-14B-720P"
+checkpoint_dir: "/project/peilab/licheng/models/Wan2.1-I2V-14B-720P"
 output_dir: "./output_lora"
 
 # Data Configuration
-data_path: "/disk2/licheng/datasets/beat_block_hammer_rollout_256_80/merged_beat_block_hammer.pkl"
-stats_path: "./robotwin_bbh.json"
+data_path: "/project/peilab/licheng/datasets/beat_block_hammer_rollout_256_80/merged_beat_block_hammer.pkl"
+stats_path: "./finetune/robotwin_bbh.json"
 To: 5
 Ta: 16
 action_dim: 14

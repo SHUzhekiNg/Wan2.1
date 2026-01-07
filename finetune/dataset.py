@@ -39,7 +39,6 @@ class ActionDataset(Dataset):
         # Load stats
         self.q01 = None
         self.q99 = None
-        stats_loaded = False
         
         if stats_path and os.path.exists(stats_path):
             try:
@@ -73,33 +72,9 @@ class ActionDataset(Dataset):
                     else:
                         self.q01 = q01_temp
                         self.q99 = q99_temp
-                        stats_loaded = True
                         
             except Exception as e:
                 print(f"Warning: Failed to load stats from {stats_path}: {e}. Using default normalization.")
-        
-        if not stats_loaded and self.action_dim > 0:
-            print("Calculating stats from dataset...")
-            all_actions = []
-            # Sample a subset if dataset is too large to avoid OOM or slow startup
-            # But for accuracy, we should use all.
-            count = 0
-            for res in self.data_list['results']:
-                traj = res.get('trajectory', [])
-                for step in traj:
-                    all_actions.append(step['action'])
-                    count += 1
-            
-            if count > 0:
-                all_actions = np.array(all_actions)
-                self.q01 = all_actions.min(axis=0).astype(np.float32)
-                self.q99 = all_actions.max(axis=0).astype(np.float32)
-                print(f"Calculated stats: min={self.q01}, max={self.q99}")
-
-                # Handle constant values (max == min) to avoid division by zero
-                # This is handled in __getitem__ by checking denom == 0
-            else:
-                print("Warning: No actions found in dataset to calculate stats.")
 
         # Pre-calculate windows
         self.windows = []
@@ -112,7 +87,9 @@ class ActionDataset(Dataset):
             trajectory = result.get('trajectory', [])
             total_steps = len(trajectory)
             
-            for start in range(0, total_steps - self.Ta + 1, self.stride):
+            # start should begin from (To-1) to ensure we have enough history frames
+            # Otherwise the first (To-1) frames will be duplicated from trajectory[0]
+            for start in range(self.To - 1, total_steps - self.Ta + 1, self.stride):
                 self.windows.append((traj_idx, start))
                 
     def __len__(self):

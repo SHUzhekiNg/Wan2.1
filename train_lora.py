@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
+import math
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from tqdm import tqdm
@@ -16,7 +17,8 @@ from wan.modules.clip import CLIPModel
 from wan.configs.shared_config import wan_shared_cfg
 
 from finetune.dataset import ActionDataset
-from finetune.models import WanActionModel
+from finetune.model_action import WanActionModel
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 def main():
     # Load configuration from YAML
@@ -67,19 +69,59 @@ def main():
     base_model = WanModel.from_pretrained(
         args.checkpoint_dir, 
         model_type='i2v', 
-        torch_dtype=torch.bfloat16, 
-        low_cpu_mem_usage=True
+        torch_dtype=torch.bfloat16
     )
-    base_model.requires_grad_(False) # Freeze base model
     
     # Action Model (LoRA + Action Encoder)
     model = WanActionModel(
-        base_model, 
-        action_dim=args.action_dim, 
-        # state_dim removed
-        hidden_dim=1024, 
-        lora_rank=args.lora_rank
+        model_type='i2v',
+        patch_size=base_model.patch_size,
+        text_len=base_model.text_len,
+        in_dim=36,  # I2V: 16 (latent) + 20 (4 mask + 16 condition) = 36
+        dim=base_model.dim,
+        ffn_dim=base_model.ffn_dim,
+        freq_dim=base_model.freq_dim,
+        text_dim=base_model.text_dim,
+        action_dim=args.action_dim,
+        action_hidden_dim=1024,
+        out_dim=base_model.out_dim,
+        num_heads=base_model.num_heads,
+        num_layers=base_model.num_layers,
+        window_size=base_model.window_size,
+        qk_norm=base_model.qk_norm,
+        cross_attn_norm=base_model.cross_attn_norm,
+        eps=base_model.eps
+    ).to(device, dtype=torch.bfloat16)
+
+    # Load weights from base model
+    model.load_state_dict(base_model.state_dict(), strict=False)
+    del base_model
+    torch.cuda.empty_cache()
+
+    # Freeze all parameters first
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Unfreeze action parameters BEFORE applying LoRA
+    for name, param in model.named_parameters():
+        if "action_encoder" in name or "action_adaln_proj" in name:
+            param.requires_grad = True
+
+    # Apply LoRA - this will add LoRA adapters to specified modules
+    print("Applying LoRA adapters...")
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_rank * 2,
+        target_modules=["q", "k", "v", "o", "ffn.0", "ffn.2"],
+        lora_dropout=0.05,
+        bias="none",
     )
+    model = get_peft_model(model, lora_config)
+    
+    # Print trainable parameters for verification
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Trainable params: {trainable_params:,} || Total params: {total_params:,} || Trainable%: {100 * trainable_params / total_params:.2f}%")
 
     # 2. Dataset
     with open(args.data_path, 'rb') as f:
@@ -114,73 +156,77 @@ def main():
             prompts = batch["prompt"] # List of strings
 
             with torch.no_grad():
-                latents = vae.encode(video) # (B, C, T', H', W')
+                # Convert batch tensor to list for VAE
+                video_list = [video[i] for i in range(video.shape[0])]
+                
+                latents = vae.encode(video_list) # List of (16, T', H', W')
                 context = t5_encoder(prompts, device) 
                 
                 # Prepare I2V conditions
-                # 1. CLIP Features
-                # video is (B, C, T, H, W), [-1, 1]
-                # Extract first frame as list of (C, 1, H, W)
-                first_frames = [v[:, 0:1, :, :] for v in video]
+                # 1. CLIP Features - extract first frame
+                first_frames = [v[:, 0:1, :, :] for v in video_list]
                 clip_fea = clip_model.visual(first_frames) # (B, 257, 1280)
                 
-                # 2. VAE Condition (y)
-                # Construct y_video: first frame + zeros
+                # 2. VAE Condition (y) - following original I2V implementation
+                # For each video, create: first frame + zeros for rest
                 y_videos = []
-                for v in video:
+                for v in video_list:
                     # v: (C, T, H, W)
                     y_v = torch.zeros_like(v)
-                    y_v[:, 0, :, :] = v[:, 0, :, :] # Copy first frame
+                    y_v[:, 0, :, :] = v[:, 0, :, :] # Copy first frame only
                     y_videos.append(y_v)
                 
-                y_latents = vae.encode(y_videos) # List of (C, T', H', W')
-                y_latents = torch.stack(y_latents).to(torch.bfloat16)
+                y_latents = vae.encode(y_videos) # List of (16, T', H', W')
                 
-                # 3. Mask
-                # Create mask matching y_latents shape
-                # y_latents shape: (B, 16, T', H', W')
-                # Mask should be (B, 4, T', H', W')
-                
-                B_sz, C_sz, T_sz, H_sz, W_sz = y_latents.shape
-                
-                # Dynamic mask construction
-                # We assume the first latent frame corresponds to the first video frame (condition)
-                msk = torch.zeros(B_sz, 4, T_sz, H_sz, W_sz, device=device)
-                msk[:, :, 0, :, :] = 1.0 # Condition on first latent frame
-                
-                # Concatenate mask and y_latents
-                # y_latents: (B, 16, T', H', W')
-                # msk: (B, 4, T', H', W')
-                y = torch.cat([msk, y_latents], dim=1) # (B, 20, T', H', W')
-                
-                # Convert to list of tensors for model input
-                y = [y[i] for i in range(B_sz)]
+                # 3. Create y = mask + latents for each sample
+                y = []
+                for y_lat in y_latents:
+                    # y_lat: (16, T', H', W')
+                    C_lat, T_lat, H_lat, W_lat = y_lat.shape
+                    msk = torch.zeros(4, T_lat, H_lat, W_lat, device=device, dtype=y_lat.dtype)
+                    msk[:, 0, :, :] = 1.0  # Condition on first latent frame
+                    # Concatenate: (20, T', H', W')
+                    y_i = torch.cat([msk, y_lat], dim=0)
+                    y.append(y_i)
 
             # Flow Matching Training
             # Sample t in [0, 1]
-            # Process batch directly as tensors
-            batch_latents = torch.stack(latents).to(torch.bfloat16) # (B, C, T', H', W')
-            t = torch.rand((batch_latents.shape[0],), device=device, dtype=torch.bfloat16)
-            noise = torch.randn_like(batch_latents, dtype=torch.bfloat16)
+            B = len(latents)
+            t = torch.rand(B, device=device, dtype=torch.bfloat16)
             
-            t_expanded = t.view(-1, 1, 1, 1, 1)
-            x_t = (1 - t_expanded) * noise + t_expanded * batch_latents
-            
-            target = batch_latents - noise
+            # Create noise and interpolation for each sample
+            x_t_list = []
+            target_list = []
+            for i in range(B):
+                noise = torch.randn_like(latents[i], dtype=torch.bfloat16)
+                # Flow matching: x_t = (1-t)*noise + t*x_1
+                x_t_i = (1 - t[i]) * noise + t[i] * latents[i]
+                x_t_list.append(x_t_i)
+                # Target is the velocity: v = x_1 - noise
+                target_list.append(latents[i] - noise)
             
             # Predict velocity
-            # Model now accepts batch tensors directly
             with accelerator.autocast():
-                # Prepare context as batch tensor
-                context_batch = torch.stack([torch.cat([c.to(device), c.new_zeros(512 - c.size(0), c.size(1))]) for c in context])
-                # Prepare y as batch tensor
-                y_batch = torch.stack(y) if y and len(y) > 0 else None
+                # Calculate seq_len based on actual latent dimensions
+                # Get sample latent dimensions from first sample
+                lat_T, lat_H, lat_W = latents[0].shape[1], latents[0].shape[2], latents[0].shape[3]
+                # Access patch_size correctly through PEFT wrapper
+                if hasattr(model, 'module'):
+                    # Multi-GPU with DDP
+                    base = model.module.base_model.model if hasattr(model.module, 'base_model') else model.module
+                else:
+                    # Single GPU
+                    base = model.base_model.model if hasattr(model, 'base_model') else model
+                patch_size = base.patch_size
+                seq_len = math.ceil((lat_H * lat_W) / (patch_size[1] * patch_size[2]) * lat_T)
                 
-                pred = model(x_t, t, context_batch, seq_len=1024, actions=actions, clip_fea=clip_fea, y=y_batch)
+                # Model forward expects lists
+                pred = model(x_t_list, t, context, seq_len=seq_len, actions=actions, clip_fea=clip_fea, y=y)
             
-            # pred is a list of tensors [C, T', H', W'], convert to batch tensor
+            # pred is a list of tensors, convert to batch for loss computation
             pred_tensor = torch.stack(pred)
-            loss = F.mse_loss(pred_tensor, target)
+            target_tensor = torch.stack(target_list)
+            loss = F.mse_loss(pred_tensor, target_tensor)
             
             accelerator.backward(loss)
             optimizer.step()
@@ -192,7 +238,9 @@ def main():
         if accelerator.is_local_main_process:
             os.makedirs(args.output_dir, exist_ok=True)
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_lora_weights(os.path.join(args.output_dir, f"lora_epoch_{epoch}.pth"))
+            # Save only trainable parameters (LoRA + Action)
+            state_dict = get_peft_model_state_dict(unwrapped_model)
+            torch.save(state_dict, os.path.join(args.output_dir, f"lora_epoch_{epoch}.pth"))
 
 if __name__ == "__main__":
     main()
