@@ -8,9 +8,9 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
 class ActionDataset(Dataset):
-    def __init__(self, data_list, stats_path=None, To=5, Ta=16, stride=1, 
+    def __init__(self, data_list, stats_path=None, To=1, Ta=16, stride=1, 
                  camera_names=['cam_high', 'cam_low', 'cam_left', 'cam_right'], 
-                 image_size=(256, 320), transform=None):
+                 image_size=(240, 320), transform=None):
         """
         Args:
             data_list: List of 'result' dicts, each containing a 'trajectory'.
@@ -34,12 +34,12 @@ class ActionDataset(Dataset):
         # Determine action dim from data
         self.action_dim = 0
         if 'results' in self.data_list and len(self.data_list['results']) > 0:
-             # Find first non-empty trajectory
-             for res in self.data_list['results']:
-                 traj = res.get('trajectory', [])
-                 if len(traj) > 0:
-                     self.action_dim = len(traj[0]['action'])
-                     break
+            # Find first non-empty trajectory
+            for res in self.data_list['results']:
+                traj = res.get('trajectory', [])
+                if len(traj) > 0:
+                    self.action_dim = len(traj[0]['action'])
+                    break
 
         # Load stats
         self.q01 = None
@@ -49,11 +49,9 @@ class ActionDataset(Dataset):
             try:
                 with open(stats_path, "r") as f:
                     stats = json.load(f)
-                
                 # Logic adapted from SimpleVLAWebDataset to handle different stats formats
                 q01_temp = None
                 q99_temp = None
-                
                 if "action" in stats and "min" in stats["action"]:
                      q01_temp = np.asarray(stats["action"]["min"], np.float32)
                      q99_temp = np.asarray(stats["action"]["max"], np.float32)
@@ -87,16 +85,14 @@ class ActionDataset(Dataset):
             results = self.data_list['results']
         else:
             results = [] 
-            
         for traj_idx, result in enumerate(results):
             trajectory = result.get('trajectory', [])
             total_steps = len(trajectory)
-            
             # start should begin from (To-1) to ensure we have enough history frames
-            # Otherwise the first (To-1) frames will be duplicated from trajectory[0]
             for start in range(self.To - 1, total_steps - self.Ta + 1, self.stride):
                 self.windows.append((traj_idx, start))
-                
+
+
     def __len__(self):
         return len(self.windows)
 
@@ -112,8 +108,8 @@ class ActionDataset(Dataset):
         frames = []
         actions = []
         
-        # Video frames: To history frames [vs, start]
-        for i in range(vs, start + 1):
+        # Video frames: To history + (Ta-To) future frames [vs, vs + Ta)
+        for i in range(vs, vs + self.Ta):
             idx_to_use = max(0, i) 
             idx_to_use = min(idx_to_use, len(trajectory) - 1)
             
@@ -126,9 +122,9 @@ class ActionDataset(Dataset):
                 if img_data is not None:
                     if isinstance(img_data, np.ndarray):
                         if img_data.shape[0] == 3: # (C, H, W)
-                            img = torch.from_numpy(img_data).float()
+                            img = torch.from_numpy(img_data).to(torch.bfloat16)
                         else: # (H, W, C)
-                            img = torch.from_numpy(img_data).permute(2, 0, 1).float()
+                            img = torch.from_numpy(img_data).permute(2, 0, 1).to(torch.bfloat16)
                     else:
                         img = torch.zeros((3, self.image_size[0], self.image_size[1]))
                 else:
@@ -140,11 +136,17 @@ class ActionDataset(Dataset):
                 img = img / 127.5 - 1.0
                 cam_imgs.append(img)
             
-            # Tile 2x2: [cam0, cam1] / [cam2, cam3]
-            top = torch.cat([cam_imgs[0], cam_imgs[1]], dim=2)
-            bottom = torch.cat([cam_imgs[2], cam_imgs[3]], dim=2)
-            combined = torch.cat([top, bottom], dim=1)
-                
+            num_cams = len(cam_imgs)
+            if num_cams == 1:
+                combined = cam_imgs[0]
+            elif num_cams == 4:
+                # 4 cameras: 2x2 grid [cam0, cam1] / [cam2, cam3]
+                top = torch.cat([cam_imgs[0], cam_imgs[1]], dim=2)
+                bottom = torch.cat([cam_imgs[2], cam_imgs[3]], dim=2)
+                combined = torch.cat([top, bottom], dim=1)
+            else: 
+                combined = torch.cat(cam_imgs, dim=1)  # Cat along height
+            
             if self.transform:
                 combined = self.transform(combined)
             frames.append(combined)
@@ -156,7 +158,7 @@ class ActionDataset(Dataset):
             act = step['action']
             actions.append(act)
             
-        # Stack video: (To, C, 2*h, 2*w)
+        # Stack video: (To+Ta+1, C, 2*h, 2*w)
         video = torch.stack(frames).to(torch.bfloat16) 
         
         actions_np = np.array(actions)

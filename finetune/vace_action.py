@@ -20,8 +20,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
-from ..wan.modules.vace_model import VaceWanModel
-from ..wan.text2video import (
+from .vace_model_action import VaceWanActionModel
+from wan.text2video import (
     FlowDPMSolverMultistepScheduler,
     FlowUniPCMultistepScheduler,
     T5EncoderModel,
@@ -31,10 +31,10 @@ from ..wan.text2video import (
     retrieve_timesteps,
     shard_model,
 )
-from ..wan.utils.vace_processor import VaceVideoProcessor
+from wan.utils.vace_processor import VaceVideoProcessor
 
 
-class WanVace(WanT2V):
+class WanActionVace(WanT2V):
 
     def __init__(
         self,
@@ -92,13 +92,13 @@ class WanVace(WanT2V):
             device=self.device)
 
         logging.info(f"Creating VaceWanModel from {checkpoint_dir}")
-        self.model = VaceWanModel.from_pretrained(checkpoint_dir)
+        self.model = VaceWanActionModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
 
-            from ..wan.distributed.xdit_context_parallel import (
+            from wan.distributed.xdit_context_parallel import (
                 usp_attn_forward,
                 usp_dit_forward,
                 usp_dit_forward_vace,
@@ -297,6 +297,7 @@ class WanVace(WanT2V):
                  input_frames,
                  input_masks,
                  input_ref_images,
+                 actions=None,
                  size=(1280, 720),
                  frame_num=81,
                  context_scale=1.0,
@@ -313,6 +314,8 @@ class WanVace(WanT2V):
         Args:
             input_prompt (`str`):
                 Text prompt for content generation
+            actions (`Tensor`, *optional*, defaults to None):
+                Action trajectory for conditioning
             size (tupele[`int`], *optional*, defaults to (1280,720)):
                 Controls video resolution, (width,height).
             frame_num (`int`, *optional*, defaults to 81):
@@ -437,12 +440,14 @@ class WanVace(WanT2V):
                     latent_model_input,
                     t=timestep,
                     vace_context=z,
+                    actions=actions,
                     vace_context_scale=context_scale,
                     **arg_c)[0]
                 noise_pred_uncond = self.model(
                     latent_model_input,
                     t=timestep,
                     vace_context=z,
+                    actions=actions,
                     vace_context_scale=context_scale,
                     **arg_null)[0]
 
@@ -497,7 +502,7 @@ class WanVaceMP(WanVace):
         self.ring_size = ring_size
         self.dynamic_load()
 
-        self.device = 'cpu' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.vid_proc = VaceVideoProcessor(
             downsample=tuple(
                 [x * y for x, y in zip(config.vae_stride, config.patch_size)]),
@@ -604,14 +609,14 @@ class WanVaceMP(WanVace):
                 vae_pth=os.path.join(self.checkpoint_dir,
                                      self.config.vae_checkpoint),
                 device=gpu)
-            logging.info(f"Creating VaceWanModel from {self.checkpoint_dir}")
-            model = VaceWanModel.from_pretrained(self.checkpoint_dir)
+            logging.info(f"Creating VaceActionWanModel from {self.checkpoint_dir}")
+            model = VaceActionWanModel.from_pretrained(self.checkpoint_dir)
             model.eval().requires_grad_(False)
 
             if self.use_usp:
                 from xfuser.core.distributed import get_sequence_parallel_world_size
 
-                from ..wan.distributed.xdit_context_parallel import (
+                from wan.distributed.xdit_context_parallel import (
                     usp_attn_forward,
                     usp_dit_forward,
                     usp_dit_forward_vace,
@@ -640,12 +645,13 @@ class WanVaceMP(WanVace):
 
             while True:
                 item = in_q.get()
-                input_prompt, input_frames, input_masks, input_ref_images, size, frame_num, context_scale, \
+                input_prompt, input_frames, input_masks, input_ref_images, actions, size, frame_num, context_scale, \
                 shift, sample_solver, sampling_steps, guide_scale, n_prompt, seed, offload_model = item
                 input_frames = self.transfer_data_to_cuda(input_frames, gpu)
                 input_masks = self.transfer_data_to_cuda(input_masks, gpu)
                 input_ref_images = self.transfer_data_to_cuda(
                     input_ref_images, gpu)
+                actions = self.transfer_data_to_cuda(actions, gpu)
 
                 if n_prompt == "":
                     n_prompt = sample_neg_prompt
@@ -728,12 +734,14 @@ class WanVaceMP(WanVace):
                             latent_model_input,
                             t=timestep,
                             vace_context=z,
+                            actions=actions,
                             vace_context_scale=context_scale,
                             **arg_c)[0]
                         noise_pred_uncond = model(
                             latent_model_input,
                             t=timestep,
                             vace_context=z,
+                            actions=actions,
                             vace_context_scale=context_scale,
                             **arg_null)[0]
 
@@ -775,6 +783,7 @@ class WanVaceMP(WanVace):
                  input_frames,
                  input_masks,
                  input_ref_images,
+                 actions=None,
                  size=(1280, 720),
                  frame_num=81,
                  context_scale=1.0,
@@ -787,9 +796,9 @@ class WanVaceMP(WanVace):
                  offload_model=True):
 
         input_data = (input_prompt, input_frames, input_masks, input_ref_images,
-                      size, frame_num, context_scale, shift, sample_solver,
-                      sampling_steps, guide_scale, n_prompt, seed,
-                      offload_model)
+                      actions, size, frame_num, context_scale, shift,
+                      sample_solver, sampling_steps, guide_scale, n_prompt,
+                      seed, offload_model)
         for in_q in self.in_q_list:
             in_q.put(input_data)
         value_output = self.out_q.get()

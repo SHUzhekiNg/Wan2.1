@@ -1,0 +1,27 @@
+# Training Configuration for Wan2.1 Action LoRA
+
+# Model Paths
+checkpoint_dir: "/project/peilab/licheng/models/Wan2.1-VACE-14B-720P"
+output_dir: "./output_lora"
+
+# Data Configuration
+data_path: "/project/peilab/licheng/codes/RoboTwin/tmp/4cam_16rollouts_bbh_seed200004.pkl"
+stats_path: "./finetune/robotwin_bbh.json"
+To: 1
+Ta: 16
+camera_names: ['cam_high', 'cam_left_wrist', 'cam_right_wrist', 'cam_low']
+image_size: [240, 320]
+action_dim: 14
+action_hidden_dim: 128
+vace_in_dim: 96
+num_workers: 4
+
+# Training Hyperparameters
+batch_size: 1
+gradient_accumulation_steps: 4
+lr: 0.0001
+epochs: 10
+lora_rank: 16
+
+# Hardware
+mixed_precision: "bf16"

@@ -4,7 +4,62 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
 
-from ..wan.modules.model import WanAttentionBlock, WanModel, sinusoidal_embedding_1d
+from wan.modules.model import WanAttentionBlock, WanModel, sinusoidal_embedding_1d
+
+
+class ActionEncoder(nn.Module):
+    def __init__(self, action_dim, hidden_dim, output_dim, temporal_downsample=False):
+        """
+        ActionEncoder using 1D temporal convolution to aggregate actions.
+        
+        Args:
+            action_dim: Dimension of each action vector
+            hidden_dim: Hidden dimension for internal processing
+            output_dim: Output dimension (should be 6 * model_dim for AdaLN-zero)
+            num_frames: Number of output latent frames
+        """
+        super().__init__()
+        
+        # Action embedding MLP
+        self.action_embedding = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Use Video VAE-style temporal downsampling, the downsample rate is fixed 4x
+        # 4x downsampling: stride=4, kernel=5, padding=2
+        # Output: (T + 2*2 - 5) // 4 + 1 = (T - 1) // 4 + 1 (for valid T)
+        if temporal_downsample:
+            self.temporal_conv = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, stride=4, padding=2),
+                nn.GELU(),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GELU()
+            )
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        
+        # Zero-init for AdaLN-Zero strategy
+        # At initialization, action path contributes 0, preserving pretrained behavior
+        nn.init.constant_(self.output_proj.weight, 0)
+        nn.init.constant_(self.output_proj.bias, 0)
+
+    def forward(self, actions):
+        """
+        Args:
+            actions: (B, Ta, action_dim) - sequence of actions
+        Returns:
+            output: (B, num_frames, output_dim) - aggregated action features
+        """
+        
+        x = self.action_embedding(actions)  # (B, Ta, hidden_dim)
+        if hasattr(self, 'temporal_conv'):
+            x = x.transpose(1, 2)
+            x = self.temporal_conv(x)  # (B, hidden_dim, T')
+            x = x.transpose(1, 2)
+        output = self.output_proj(x)  # (B, num_frames, output_dim)
+        return output
 
 
 class VaceWanAttentionBlock(WanAttentionBlock):
@@ -62,10 +117,12 @@ class BaseWanAttentionBlock(WanAttentionBlock):
         return x
 
 
-class VaceWanModel(WanModel):
+class VaceWanActionModel(WanModel):
 
     @register_to_config
     def __init__(self,
+                 action_dim=14,
+                 action_hidden_dim=128,
                  vace_layers=None,
                  vace_in_dim=None,
                  model_type='vace',
@@ -83,9 +140,25 @@ class VaceWanModel(WanModel):
                  qk_norm=True,
                  cross_attn_norm=True,
                  eps=1e-6):
+        """
+        Args:
+            action_dim: Dimension of action vector
+            action_hidden_dim: Hidden dimension for action encoder
+            ... (other args from base WanModel)
+        """
         super().__init__(model_type, patch_size, text_len, in_dim, dim, ffn_dim,
                          freq_dim, text_dim, out_dim, num_heads, num_layers,
                          window_size, qk_norm, cross_attn_norm, eps)
+
+        self.action_dim = action_dim
+        self.action_hidden_dim = action_hidden_dim
+        
+        self.action_encoder = ActionEncoder(
+            action_dim=action_dim, 
+            hidden_dim=action_hidden_dim, 
+            output_dim=6*self.dim,
+            temporal_downsample=False
+        )
 
         self.vace_layers = [i for i in range(0, self.num_layers, 2)
                            ] if vace_layers is None else vace_layers
@@ -159,33 +232,11 @@ class VaceWanModel(WanModel):
         vace_context,
         context,
         seq_len,
+        actions=None,
         vace_context_scale=1.0,
         clip_fea=None,
         y=None,
     ):
-        r"""
-        Forward pass through the diffusion model
-
-        Args:
-            x (List[Tensor]):
-                List of input video tensors, each with shape [C_in, F, H, W]
-            t (Tensor):
-                Diffusion timesteps tensor of shape [B]
-            context (List[Tensor]):
-                List of text embeddings each with shape [L, C]
-            seq_len (`int`):
-                Maximum sequence length for positional encoding
-            clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
-            y (List[Tensor], *optional*):
-                Conditional video inputs for image-to-video mode, same shape as x
-
-        Returns:
-            List[Tensor]:
-                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
-        """
-        # if self.model_type == 'i2v':
-        #     assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -213,6 +264,17 @@ class VaceWanModel(WanModel):
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
+        # actions: (B, Ta, action_dim)
+        if actions is not None:
+            with amp.autocast(dtype=torch.float32):
+                act_e = self.action_encoder(actions) # (B, num_latent_frames, dim)
+                act_e = act_e.mean(dim=1)  # Aggregate over time: (B, dim)
+                act_e = act_e.unflatten(-1, (6, self.dim)) 
+                # Combined modulation (now global)
+                e_total = e0 + act_e
+        else:
+            e_total = e0
+
         # context
         context_lens = None
         context = self.text_embedding(
@@ -228,7 +290,7 @@ class VaceWanModel(WanModel):
 
         # arguments
         kwargs = dict(
-            e=e0,
+            e=e_total,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
             freqs=self.freqs,

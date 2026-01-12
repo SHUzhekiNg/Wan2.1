@@ -295,7 +295,12 @@ class WanAttentionBlock(nn.Module):
         """
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e).chunk(6, dim=1)
+            e = self.modulation + e
+            if e.ndim == 4:
+                e = e.chunk(6, dim=2)
+                e = [u.squeeze(2) for u in e]
+            else:
+                e = e.chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
         # self-attention
