@@ -18,7 +18,6 @@ num_workers: 4
 
 # Training Hyperparameters
 batch_size: 1
-gradient_accumulation_steps: 4
 lr: 0.0001
 epochs: 10
 lora_rank: 16

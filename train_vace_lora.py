@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.cuda.amp as amp
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType, FullStateDictConfig, ShardingStrategy, MixedPrecision
 from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
@@ -102,6 +103,11 @@ def setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
+
+def print_gpu_utilization():
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB")
 
 def save_lora_checkpoint(model, output_path, rank):
     # Extract the full state dict to CPU on rank 0
@@ -235,7 +241,11 @@ def main():
     # 3. Training Loop
     if rank == 0:
         print(f"Starting training for {args.epochs} epochs...")
+        log_dir = os.path.join(args.output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
 
+    global_step = 0
     for epoch in range(args.epochs):
         model.train()
         sampler.set_epoch(epoch)
@@ -283,8 +293,6 @@ def main():
                 x_t_list.append(x_t)
                 target_list.append(latents[i].to(dtype) - noise)
             
-            optimizer.zero_grad()
-            
             # Predict
             lat_T, lat_H, lat_W = latents[0].shape[1], latents[0].shape[2], latents[0].shape[3]
             patch_size = model.module.base_model.model.patch_size
@@ -301,12 +309,21 @@ def main():
                 )
                 
                 loss = F.mse_loss(torch.stack(pred), torch.stack(target_list))
-            
+            # print_gpu_utilization() # batch size 1: Allocated: 67.30 GB | Reserved: 74.55 GB
             loss.backward()
             optimizer.step()
-            
+            # print_gpu_utilization() # batch size 1: Allocated: 17.57 GB | Reserved: 46.79 GB
+            optimizer.zero_grad()
+
             if rank == 0:
-                pbar.set_description(f"Epoch {epoch} Loss: {loss.item():.4f}")
+                loss_value = loss.item()
+                pbar.set_description(f"Epoch {epoch} Loss: {loss_value:.4f}")
+                
+                # Log to tensorboard
+                writer.add_scalar('Loss/train', loss_value, global_step)
+                writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], global_step)
+            
+            global_step += 1
 
         # Save Checkpoint
         dist.barrier()
@@ -314,6 +331,11 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
             save_lora_checkpoint(model, os.path.join(args.output_dir, f"lora_epoch_{epoch}.pth"), rank)
         dist.barrier()
+    
+    # Close tensorboard writer
+    if rank == 0:
+        writer.close()
+        print("Training completed. TensorBoard logs saved to", log_dir)
 
 if __name__ == "__main__":
     main()
