@@ -3,6 +3,7 @@
 # Model Paths
 checkpoint_dir: "/project/peilab/licheng/models/Wan2.1-VACE-14B-720P"
 output_dir: "./output_lora"
+resume_checkpoint: ""
 
 # Data Configuration
 data_path: "/project/peilab/licheng/codes/RoboTwin/tmp/4cam_16rollouts_bbh_seed200004.pkl"

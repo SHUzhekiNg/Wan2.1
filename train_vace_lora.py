@@ -128,6 +128,35 @@ def save_lora_checkpoint(model, output_path, rank):
         torch.save(lora_state_dict, output_path)
         print(f"Saved LoRA and Action weights to {output_path}")
 
+def load_lora_checkpoint(model, checkpoint_path, rank):
+    if not checkpoint_path:
+        return
+    
+    if os.path.isdir(checkpoint_path):
+        # find the latest lora_epoch_*.pth
+        checkpoints = [f for f in os.listdir(checkpoint_path) if f.startswith("lora_epoch_") and f.endswith(".pth")]
+        if not checkpoints:
+            if rank == 0:
+                print(f"No lora_epoch_*.pth found in {checkpoint_path}")
+            return
+        # sort by epoch number
+        checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        checkpoint_path = os.path.join(checkpoint_path, checkpoints[-1])
+
+    if not os.path.exists(checkpoint_path):
+        if rank == 0:
+            print(f"Checkpoint {checkpoint_path} not found, skipping.")
+        return
+    
+    if rank == 0:
+        print(f"Loading LoRA and Action weights from {checkpoint_path}")
+    
+    # Load on all ranks to avoid manual broadcasting before FSDP
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    info = model.load_state_dict(state_dict, strict=False)
+    if rank == 0:
+        print(f"Loaded checkpoint. Missing keys: {len(info.missing_keys)}, Unexpected keys: {len(info.unexpected_keys)}")
+
 def main():
     local_rank = setup_distributed()
     rank = dist.get_rank()
@@ -192,6 +221,10 @@ def main():
     model = get_peft_model(model, lora_config)
     model.to(dtype)
     
+    # Load LoRA checkpoint if provided
+    if args.get("resume_checkpoint"):
+        load_lora_checkpoint(model, args.resume_checkpoint, rank)
+
     # FSDP Wrapping
     # Note: we wrap the blocks specifically for memory efficiency
     # auto_wrap_policy = partial(
@@ -263,23 +296,15 @@ def main():
                 
                 # VACE conditioning
                 # Create pixel-level mask: 1 = Target (hidden), 0 = Context (visible)
-                # Obs frames (0 to To-1) are context -> mask=0
-                # Future frames (To to end) are target -> mask=1
                 B, C, T, H, W = video.shape
                 pixel_mask = torch.ones(B, 1, T, H, W, device=device, dtype=dtype)
                 if args.To > 0:
                     pixel_mask[:, :, :args.To, :, :] = 0.0
                 
                 mask_list = [pixel_mask[i] for i in range(B)]
-                
-                # Encode frames with VAE (inactive/reactive split)
                 z0 = vace_encode_frames(video_list, mask_list, vae=vae)
-                
-                # Encode masks (spatial folding)
-                vae_stride = (4, 8, 8) # Wan2.1 default
+                vae_stride = (4, 8, 8)
                 m0 = vace_encode_masks(mask_list, vae_stride=vae_stride)
-                
-                # Combine
                 y = vace_latent(z0, m0)
 
             # Sample t and create noisy latents
