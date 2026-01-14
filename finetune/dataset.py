@@ -45,39 +45,38 @@ class ActionDataset(Dataset):
         self.q01 = None
         self.q99 = None
         
-        if stats_path and os.path.exists(stats_path):
-            try:
-                with open(stats_path, "r") as f:
-                    stats = json.load(f)
-                # Logic adapted from SimpleVLAWebDataset to handle different stats formats
-                q01_temp = None
-                q99_temp = None
-                if "action" in stats and "min" in stats["action"]:
-                     q01_temp = np.asarray(stats["action"]["min"], np.float32)
-                     q99_temp = np.asarray(stats["action"]["max"], np.float32)
-                elif "action" in stats and "q01" in stats["action"]:
-                     q01_temp = np.asarray(stats["action"]["q01"], np.float32)
-                     q99_temp = np.asarray(stats["action"]["q99"], np.float32)
+        if not os.path.exists(stats_path):
+            print(f"Warning: Stats file {stats_path} not found. Using default normalization.")
+        else:
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+            # Logic adapted from SimpleVLAWebDataset to handle different stats formats
+            q01_temp = None
+            q99_temp = None
+            if "action" in stats and "q01" in stats["action"]:
+                q01_temp = np.asarray(stats["action"]["q01"], np.float32)
+                q99_temp = np.asarray(stats["action"]["q99"], np.float32)
+            elif "action" in stats and "min" in stats["action"]:
+                q01_temp = np.asarray(stats["action"]["min"], np.float32)
+                q99_temp = np.asarray(stats["action"]["max"], np.float32)
+            else:
+                # Try nested key (like in libero stats)
+                key = list(stats.keys())[0]
+                if "action" in stats[key]:
+                    if "q01" in stats[key]["action"]:
+                        q01_temp = np.asarray(stats[key]["action"]["q01"], np.float32)
+                        q99_temp = np.asarray(stats[key]["action"]["q99"], np.float32)
+                    elif "min" in stats[key]["action"]:
+                        q01_temp = np.asarray(stats[key]["action"]["min"], np.float32)
+                        q99_temp = np.asarray(stats[key]["action"]["max"], np.float32)
+            
+            if q01_temp is not None:
+                if self.action_dim > 0 and q01_temp.shape[0] != self.action_dim:
+                    print(f"Warning: Loaded stats dimension {q01_temp.shape[0]} does not match data action dim {self.action_dim}. Ignoring loaded stats.")
                 else:
-                    # Try nested key (like in libero stats)
-                    key = list(stats.keys())[0]
-                    if "action" in stats[key]:
-                        if "min" in stats[key]["action"]:
-                            q01_temp = np.asarray(stats[key]["action"]["min"], np.float32)
-                            q99_temp = np.asarray(stats[key]["action"]["max"], np.float32)
-                        else:
-                            q01_temp = np.asarray(stats[key]["action"]["q01"], np.float32)
-                            q99_temp = np.asarray(stats[key]["action"]["q99"], np.float32)
-                
-                if q01_temp is not None:
-                    if self.action_dim > 0 and q01_temp.shape[0] != self.action_dim:
-                        print(f"Warning: Loaded stats dimension {q01_temp.shape[0]} does not match data action dim {self.action_dim}. Ignoring loaded stats.")
-                    else:
-                        self.q01 = q01_temp
-                        self.q99 = q99_temp
-                        
-            except Exception as e:
-                print(f"Warning: Failed to load stats from {stats_path}: {e}. Using default normalization.")
+                    self.q01 = q01_temp
+                    self.q99 = q99_temp
+
 
         # Pre-calculate windows
         self.windows = []
@@ -168,6 +167,8 @@ class ActionDataset(Dataset):
             denom = self.q99 - self.q01
             denom[denom == 0] = 1.0
             actions_norm = 2 * ((actions_np - self.q01) / denom) - 1
+            # Clip to [-1, 1] to handle outliers if using percentiles
+            actions_norm = np.clip(actions_norm, -1.0, 1.0)
             actions = torch.from_numpy(actions_norm).to(torch.bfloat16)
         else:
             actions = torch.from_numpy(actions_np).to(torch.bfloat16)

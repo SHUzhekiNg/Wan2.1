@@ -117,12 +117,10 @@ def save_lora_checkpoint(model, output_path, rank):
     
     if rank == 0:
         # Extract LoRA weights + ActionEncoder (which are the only trainable parts)
-        lora_state_dict = get_peft_model_state_dict(model, state_dict=state_dict)
-        
-        # Manually add ActionEncoder and point-wise modulation parameters
-        # These are marked as requires_grad but not captured by get_peft_model_state_dict
+        # Filter state_dict to only include LoRA and action-related parameters
+        lora_state_dict = {}
         for k, v in state_dict.items():
-            if "action_encoder" in k or "action_adaln_proj" in k:
+            if "lora_" in k or "action_encoder" in k or "action_adaln_proj" in k:
                 lora_state_dict[k] = v
                 
         torch.save(lora_state_dict, output_path)
@@ -204,11 +202,6 @@ def main():
     # Freeze backbone
     model.requires_grad_(False)
     
-    # Unfreeze Action components BEFORE LoRA
-    for name, param in model.named_parameters():
-        if "action_encoder" in name:
-            param.requires_grad = True
-
     # Apply LoRA
     print(f"Applying LoRA to VACE Model on Rank {rank}...")
     lora_config = LoraConfig(
@@ -221,20 +214,22 @@ def main():
     model = get_peft_model(model, lora_config)
     model.to(dtype)
     
+    # Unfreeze Action components
+    for name, param in model.named_parameters():
+        if "action_encoder" in name:
+            param.requires_grad = True
+
     # Load LoRA checkpoint if provided
     if args.get("resume_checkpoint"):
         load_lora_checkpoint(model, args.resume_checkpoint, rank)
 
     # FSDP Wrapping
     # Note: we wrap the blocks specifically for memory efficiency
-    # auto_wrap_policy = partial(
-    #     lambda_auto_wrap_policy, 
-    #     lambda_fn=lambda m: m in model.base_model.model.blocks or m in model.base_model.model.vace_blocks
-    # )
-    
+    # Wrap individual attention blocks for better memory sharding
+    blocks_to_wrap = set(model.base_model.model.blocks) | set(model.base_model.model.vace_blocks)
     auto_wrap_policy = partial(
-        lambda_auto_wrap_policy,
-        lambda_fn=lambda m: isinstance(m, (VaceWanActionModel))
+        lambda_auto_wrap_policy, 
+        lambda_fn=lambda m: m in blocks_to_wrap
     )
 
     mixed_precision_policy = MixedPrecision(
@@ -335,10 +330,10 @@ def main():
                 
                 loss = F.mse_loss(torch.stack(pred), torch.stack(target_list))
             # print_gpu_utilization() # batch size 1: Allocated: 67.30 GB | Reserved: 74.55 GB
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             # print_gpu_utilization() # batch size 1: Allocated: 17.57 GB | Reserved: 46.79 GB
-            optimizer.zero_grad()
 
             if rank == 0:
                 loss_value = loss.item()
